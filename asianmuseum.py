@@ -5,19 +5,14 @@ from torchvision import transforms, models
 from PIL import Image
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from encryption import encryptor  # Импортируем шифратор
+import io
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Для облака используем относительные пути
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Пути к папкам с данными (относительные)
 dataset_path = os.path.join(script_dir, 'MyDataset', 'path_to_images')
 descriptions_path = os.path.join(script_dir, 'MyDataset', 'path_to_descriptions')
-
-# Создаем папки если их нет
-os.makedirs(dataset_path, exist_ok=True)
-os.makedirs(descriptions_path, exist_ok=True)
 
 data_transforms = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -39,54 +34,65 @@ class MuseumSystem:
         self.feature_extractor.eval()
         self.database = []
         self.features = None
+        self.encrypted_images = {}  # Храним зашифрованные изображения
         
     def build_database(self):
-        print("Загружаю базу музея...")
+        print("🔒 Загружаю и шифрую базу музея...")
         
-        # Проверяем существование папок
         if not os.path.exists(dataset_path):
-            print(f"ОШИБКА: Папка с изображениями не найдена: {dataset_path}")
+            print(f"❌ Папка не найдена: {dataset_path}")
             return False
-        if not os.path.exists(descriptions_path):
-            print(f"ОШИБКА: Папка с описаниями не найдена: {descriptions_path}")
-            return False
-        
+            
         for class_name in sorted(os.listdir(dataset_path)):
             class_image_dir = os.path.join(dataset_path, class_name)
-            class_desc_dir = os.path.join(descriptions_path, class_name)
             
             if not os.path.isdir(class_image_dir):
                 continue
                 
             for image_file in os.listdir(class_image_dir):
-                if image_file.lower().endswith('.jpg'):
+                if image_file.lower().endswith(('.jpg', '.jpeg', '.png')):
                     image_path = os.path.join(class_image_dir, image_file)
                     
-                    txt_file = os.path.splitext(image_file)[0] + '.txt'
-                    txt_path = os.path.join(class_desc_dir, txt_file)
+                    # Шифруем изображение
+                    encrypted_data = encryptor.encrypt_image(image_path)
+                    if encrypted_data is None:
+                        continue
                     
-                    description = "Нет описания"
+                    # Сохраняем зашифрованные данные
+                    image_id = f"{class_name}_{image_file}"
+                    self.encrypted_images[image_id] = encrypted_data
+                    
+                    # Описание
+                    description = f"Объект {class_name}"
+                    txt_file = os.path.splitext(image_file)[0] + '.txt'
+                    txt_path = os.path.join(descriptions_path, class_name, txt_file)
+                    
                     if os.path.exists(txt_path):
                         try:
                             with open(txt_path, 'r', encoding='utf-8') as f:
                                 description = f.read().strip()
                         except:
-                            description = f"Объект {class_name}"
-                    else:
-                        description = f"Объект {class_name}"
+                            pass
                     
                     self.database.append({
-                        'image_path': image_path,
+                        'image_id': image_id,
                         'description': description,
-                        'class': class_name
+                        'class': class_name,
+                        'original_name': image_file
                     })
         
-        print(f"База построена: {len(self.database)} экспонатов")
+        print(f"📊 База зашифрована: {len(self.database)} экспонатов")
         
+        # Извлекаем признаки из зашифрованных изображений
         self.features = []
-        for i, item in enumerate(self.database):
+        for item in self.database:
             try:
-                image = Image.open(item['image_path']).convert('RGB')
+                # Дешифруем для обработки нейросетью
+                encrypted_data = self.encrypted_images[item['image_id']]
+                decrypted_data = encryptor.decrypt_image(encrypted_data)
+                
+                # Создаем изображение из байтов
+                image = Image.open(io.BytesIO(decrypted_data)).convert('RGB')
                 tensor = data_transforms(image).unsqueeze(0).to(device)
                 
                 with torch.no_grad():
@@ -94,44 +100,44 @@ class MuseumSystem:
                     features = features.cpu().numpy().flatten()
                 
                 self.features.append(features)
-                print(f"Обработано {i+1}/{len(self.database)} изображений")
+                
             except Exception as e:
-                print(f"Ошибка обработки {item['image_path']}: {e}")
+                print(f"❌ Ошибка обработки {item['image_id']}: {e}")
                 self.features.append(np.zeros(512))
         
         self.features = np.array(self.features)
-        print("Признаки извлечены")
+        print("✅ Признаки извлечены из зашифрованных изображений")
         return True
     
     def search_image(self, image):
-        """Ищет похожие изображения в базе"""
         if not self.database or self.features is None:
-            return {"status": "error", "message": "База данных не загружена"}
+            return {"status": "error", "message": "База не загружена"}
         
         try:
-            # Преобразуем изображение для нейросети
             image_rgb = image.convert('RGB')
             tensor = data_transforms(image_rgb).unsqueeze(0).to(device)
             
-            # Извлекаем признаки
             with torch.no_grad():
                 user_features = self.feature_extractor(tensor)
                 user_features = user_features.cpu().numpy().flatten()
             
-            # Сравниваем с базой
             similarities = cosine_similarity([user_features], self.features)[0]
-            best_idx = np.argmax(similarities)
-            best_similarity = similarities[best_idx]
-            best_item = self.database[best_idx]
+            top_indices = np.argsort(similarities)[-3:][::-1]
             
-            # Возвращаем результат в формате JSON
-            return {
-                "status": "success",
-                "similarity": float(best_similarity),
-                "class": best_item['class'],
-                "description": best_item['description'],
-                "image_path": best_item['image_path']
-            }
+            results = []
+            for idx in top_indices:
+                if similarities[idx] > 0.1:
+                    results.append({
+                        "similarity": float(similarities[idx]),
+                        "class": self.database[idx]['class'],
+                        "description": self.database[idx]['description'],
+                        "image_name": self.database[idx]['original_name']
+                    })
+            
+            if results:
+                return {"status": "success", "results": results}
+            else:
+                return {"status": "error", "message": "Не найдено похожих"}
             
         except Exception as e:
             return {"status": "error", "message": str(e)}
